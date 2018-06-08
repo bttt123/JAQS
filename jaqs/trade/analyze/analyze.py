@@ -19,6 +19,7 @@ try:
 except NameError:
     basestring = str
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib as mpl
@@ -29,7 +30,9 @@ from matplotlib.ticker import Formatter
 from jaqs.trade.analyze.report import Report
 from jaqs.data import RemoteDataService
 from jaqs.data.basic.instrument import InstManager
+from jaqs.data.py_expression_eval import Parser
 from jaqs.trade import common
+
 import jaqs.util as jutil
 
 STATIC_FOLDER = jutil.join_relative_path("trade/analyze/static")
@@ -53,6 +56,169 @@ MPL_RCPARAMS = {'figure.facecolor': '#F6F6F6',
                 'lines.linewidth': 2.5,
                 }
 
+class AnalyzeView(object):
+    def __init__(self, data):
+        self._data = data
+
+    @property
+    def data(self):
+        return self._data
+
+    def get_ts(self, field, symbol="", start_date=0, end_date=0, keep_level=False):
+        """
+        Get time series data of single field.
+
+        Parameters
+        ----------
+        field : str or unicode
+            Single field.
+        symbol : str, optional
+            Separated by ',' default "" (all securities).
+        start_date : int, optional
+            Default 0 (self.start_date).
+        end_date : int, optional
+            Default 0 (self.start_date).
+
+        Returns
+        -------
+        res : pd.DataFrame
+            Index is int date, column is symbol.
+
+        """
+        res = self.get(symbol, start_date=start_date, end_date=end_date, fields=field)
+        if res is None:
+            print("No data. for start_date={}, end_date={}, field={}, symbol={}".format(start_date,
+                                                                                        end_date, field, symbol))
+            raise ValueError
+            return
+
+        if not keep_level and len(res.columns) and len(field.split(',')) == 1:
+            res.columns = res.columns.droplevel(level='field')
+
+        return res
+
+    def get_snapshot(self, snapshot_date, symbol="", fields=""):
+        """
+        Get snapshot of given fields and symbol at snapshot_date.
+
+        Parameters
+        ----------
+        snapshot_date : int
+            Date of snapshot.
+        symbol : str, optional
+            Separated by ',' default "" (all securities).
+        fields : str, optional
+            Separated by ',' default "" (all fields).
+
+        Returns
+        -------
+        res : pd.DataFrame
+            symbol as index, field as columns
+
+        """
+
+        # if self._snapshot is not None:
+        #     if snapshot_date not in self._snapshot:
+        #         return
+        #
+        #     df = self._snapshot[snapshot_date]
+        #     if fields:
+        #         return df[fields.split(',')]
+        #     else:
+        #         return df
+
+        res = self.get(symbol=symbol, start_date=snapshot_date, end_date=snapshot_date, fields=fields)
+        if res is None:
+            print("No data. for date={}, fields={}, symbol={}".format(snapshot_date, fields, symbol))
+            return
+
+        res = res.stack(level='symbol', dropna=False)
+        res.index = res.index.droplevel(level='trade_date')
+
+        return res
+
+    def get(self, symbol="", start_date=0, end_date=0, fields=""):
+        """
+        Basic API to get arbitrary data. If nothing fetched, return None.
+
+        Parameters
+        ----------
+        symbol : str, optional
+            Separated by ',' default "" (all securities).
+        start_date : int, optional
+            Default 0 (self.start_date).
+        end_date : int, optional
+            Default 0 (self.start_date).
+        fields : str, optional
+            Separated by ',' default "" (all fields).
+
+        Returns
+        -------
+        res : pd.DataFrame or None
+            index is datetimeindex, columns are (symbol, fields) MultiIndex
+
+        """
+        sep = ','
+
+        if self._data is None:
+            return None
+
+        if len(self._data.index) == 0:
+            return None
+
+        if not fields:
+            fields = slice(None)  # self.fields
+        else:
+            fields = fields.split(sep)
+
+        if not symbol:
+            symbol = slice(None)  # this is 3X faster than symbol = self.symbol
+        else:
+            symbol = symbol.split(sep)
+
+        if not start_date:
+            start_date = self._data.index[0]
+        if not end_date:
+            end_date = self._data.index[-1]
+
+        res = self._data.loc[pd.IndexSlice[start_date: end_date], pd.IndexSlice[symbol, fields]]
+        return res
+
+    def add_formula(self, field_name, formula, overwrite=True,
+                    formula_func_name_style='camel'):
+
+        parser = Parser()
+        parser.set_capital(formula_func_name_style)
+
+        expr = parser.parse(formula)
+
+        var_df_dic = dict()
+        var_list = expr.variables()
+
+        for var in var_list:
+            df_var = self.get_ts(var)
+            var_df_dic[var] = df_var
+
+        df_eval = parser.evaluate(var_df_dic)
+        self.add_field(df_eval, field_name)
+
+    def add_field(self, df, field_name=None):
+        """
+        Add fields to self._data.
+        :param df:
+        :param field_names: format:   'open', or 'open,close,high'
+        :return:
+        """
+        if not isinstance(df.columns, pd.core.indexes.multi.MultiIndex):
+            if not field_name:
+                raise ValueError("no field_name provided.")
+
+            df = df.copy()
+            #exist_symbols = self._data.columns.levels[0]
+            exist_symbols = df.columns
+            df.columns = pd.MultiIndex.from_product([exist_symbols, [field_name]])
+
+        self._data = pd.concat([self._data, df], axis=1).sort_index(axis=1)
 
 class TradeRecordEmptyError(Exception):
     def __init__(self, *args):
@@ -127,7 +293,7 @@ class BaseAnalyzer(object):
         self.account = None
         self.daily = None
         self.df_pnl = None
-        
+
         self.adjust_mode = None
         
         self.inst_map = dict()
@@ -136,6 +302,17 @@ class BaseAnalyzer(object):
         self.risk_metrics = dict()
         
         self.report_dic = dict()
+
+        self._holding_data   = None
+        self._portfolio_data = None
+        # self._order_data   = None
+        # self._trade_data   = None
+
+        self._alpha_decay_image = None
+        self._industry_overweight_images = None
+        self._average_industry_overweight = None
+        self._alpha_decay_weight_image = None
+        self._cum_alpha_weight_image = None
         
     @property
     def trades(self):
@@ -161,6 +338,15 @@ class BaseAnalyzer(object):
     def closes_adj(self):
         """Read-only attribute, close prices of securities in the universe"""
         return self._closes_adj
+
+    @property
+    def holding_data(self):
+        """Read-only attribute, holding data of securities in each day"""
+        return self._holding_data
+
+    @property
+    def portfolio_data(self):
+        return self._portfolio_data
 
     def initialize(self, data_api=None, dataview=None, file_folder='.'):
         """
@@ -334,6 +520,7 @@ class BaseAnalyzer(object):
             gp_df.loc[:, 'SellVolume'] = (direction - 1) / -2 * fill_size
             
             # Calculation of cumulative fields
+            gp_df.loc[:, 'TurnOver'] = turnover
             gp_df.loc[:, 'CumVolume'] = fill_size.cumsum()
             gp_df.loc[:, 'CumTurnOver'] = turnover.cumsum()
             gp_df.loc[:, 'CumNetTurnOver'] = (turnover * -direction).cumsum()
@@ -442,6 +629,17 @@ class BaseAnalyzer(object):
         res = gp.apply(_apply)
     
         self.daily = res
+
+    @staticmethod
+    def _pivot_and_sort(df):
+        data = df.unstack(level=0)
+        data.columns = data.columns.swaplevel()
+        col_names = ['symbol', 'field']
+        data.columns.names = col_names
+        data = data.sort_index(axis=1, level=col_names)
+        #data.sortlevel(axis = 1, inplace=True)
+        data.sort_index(level=0, axis=1, inplace=True)
+        return data
         
     def get_daily(self):
         """
@@ -456,12 +654,12 @@ class BaseAnalyzer(object):
         trade = self.trades
         
         # pro-process
-        trade_cols = ['trade_date', 'BuyVolume', 'SellVolume', 'commission', 'position', 'AvgPosPrice', 'CumNetTurnOver']
+        trade_cols = ['trade_date', 'BuyVolume', 'SellVolume', 'commission', 'position', 'AvgPosPrice', 'CumNetTurnOver','TurnOver']
     
         trade = trade.loc[:, trade_cols]
         gp = trade.reset_index().groupby(by=['symbol', 'trade_date'])
         func_last = lambda ser: ser.iat[-1]
-        trade = gp.agg({'BuyVolume': np.sum, 'SellVolume': np.sum, 'commission': np.sum,
+        trade = gp.agg({'BuyVolume': np.sum, 'SellVolume': np.sum, 'commission': np.sum, 'TurnOver': np.sum,
                         'position': func_last, 'AvgPosPrice': func_last, 'CumNetTurnOver': func_last})
         trade.index.names = ['symbol', 'trade_date']
 
@@ -473,9 +671,12 @@ class BaseAnalyzer(object):
         
         # calculate statistics
         close = pd.DataFrame(close.T.stack())
-        close.columns = ['close']
-        close.index.names = ['symbol', 'trade_date']
-        merge = pd.concat([close, trade], axis=1, join='outer')
+        close.columns = ['close']     
+        close.index.names = ['symbol', 'trade_date']   
+        adj_close = pd.DataFrame(self.closes_adj.T.stack())
+        adj_close.columns = ['close_adj']
+        adj_close.index.names = ['symbol', 'trade_date']         
+        merge = pd.concat([close, adj_close, trade], axis=1, join='outer')
         
         def _apply(gp_df,inst_map):
             symbol = gp_df.index.levels[0][0]
@@ -499,29 +700,117 @@ class BaseAnalyzer(object):
             gp_df['trading_pnl'] = (daily_net_turnover + mult * gp_df['close'] * daily_position_change - gp_df['commission'])            
             gp_df['holding_pnl'] = (mult * gp_df['close'].diff(1) * gp_df['position'].shift(1)).fillna(0.0)
             gp_df.loc[:, 'total_pnl'] = gp_df['trading_pnl'] + gp_df['holding_pnl']
+            gp_df['trade_shares'] = daily_position_change
             
             return gp_df
 
         gp = merge.groupby(by='symbol')
-        res = gp.apply(_apply,self.inst_map)
-        
+        res = gp.apply(_apply,self.inst_map)        
         self.daily = res
+        if self.dataview:
+            self._build_holding_data()
+            self._build_portfolio_data()
 
-    '''
-    def get_daily(self):
-        """Add various statistics to daily DataFrame."""
-        self.daily = self._get_daily(self.closes, self.trades)
-        daily_dic = dict()
-        for sec, df_trade in self.trades.items():
-            df_close = self.closes[sec].rename('close')
+        self.save_data()
+
+        print(" finished! ")
+
+    def save_data(self):
+        file_path = self.file_folder[0] + "/analyze_data.h5"
+        if self.portfolio_data is not None:
+            self.portfolio_data.to_hdf(file_path, "portfolio_data")
+        if self.holding_data  is not None:
+            self.holding_data._data.to_hdf(file_path, "holding_data")
+
+    def load_data(self):
+
+        file_path = self.file_folder[0] + "/analyze_data.h5"
+        if not os.path.exists(file_path):
+            print("load data error: no analyze_data.h5")
+            return
+
+        self._portfolio_data = pd.read_hdf(file_path, "portfolio_data")
+        self._holding_data = AnalyzeView(pd.read_hdf(file_path, "holding_data"))
+
+
+    def _build_holding_data(self):
+        assert self.dataview, "Should have dataview"
+
+        cols = ['trading_pnl', 'holding_pnl', 'total_pnl', 'commission', 'close','close_adj','position','trade_shares','AvgPosPrice']
+        daily = self.daily.loc[:, cols]
+        daily = daily.rename ( columns={'position': 'holding_shares'})
+
+        tmp = BaseAnalyzer._pivot_and_sort(daily)
+        if len(tmp.index) == 0:
+            return
+
+        holding_data = AnalyzeView(tmp)
+        self._holding_data = holding_data
+
+        start_date = holding_data._data.index[0]
+        end_date   = holding_data._data.index[-1]
+
+        #df_pos = self.get_ts("position")
+        #df_pos_chg = df_pos.diff(1).fillna(0.0)
+        #self.add_analyze_field(df_pos_chg, "trade_shares")
+
+        # Copy base data from dataview, such as OHLC, vwap, volumn.
+        #base_fields = "open,high,low,vwap,turnover,index_weight"
+        # FIXME: tzxu 20180419 no turnover in dataview!
+        base_fields = "open,high,low,vwap,index_weight,turnover2"
+        tmp = self.dataview.get_ts(base_fields, keep_level=True)
+        tmp = tmp.rename (columns={ 'turnover' : 'market_turnover'})
+        holding_data.add_field(tmp)#, base_fields.replace("turnover", "market_turnover"))
+
+        df_close_adj = holding_data.get_ts("close_adj")
+
+        df_rtn = (df_close_adj.diff(1) / df_close_adj).fillna(0.0)
+
+        s_bench_return = (self.data_benchmark.diff(1) / self.data_benchmark).fillna(0.0)
+        s_bench_return = s_bench_return.rename ( columns={'close' : 'benchmark_return'} )
+
+        df_active_return = df_rtn.sub( s_bench_return['benchmark_return'], axis=0 )
+
+        tmp = np.where(holding_data.get_ts("holding_shares") >= 1, 1, 0)
+        df_active_return = df_active_return * tmp
+        df_rtn = df_rtn * tmp
+
+        df_bench_return = df_active_return - df_active_return
+        df_bench_return = df_bench_return.add(s_bench_return['benchmark_return'], axis=0 )
+		
+        holding_data.add_field (df_rtn,           "holding_return")
+        holding_data.add_field (df_active_return, "active_holding_return")
+        holding_data.add_field (df_bench_return,  "benchmark_return")
+
+        df_fillprice   = holding_data.get_ts("AvgPosPrice")
+        df_tradeshares = holding_data.get_ts("trade_shares")
+        df_turnover    =  df_fillprice * df_tradeshares
+        holding_data.add_field(df_turnover, "strategy_turnover")
         
-            res = self._get_daily(df_close, df_trade)
-            daily_dic[sec] = res
-    
-        self.daily = daily_dic
-    '''
+        df_mktvalue = holding_data.get_ts("holding_shares") * holding_data.get_ts("close")
+        df_mktvalue = df_mktvalue.abs()
+        total_mktvalue = df_mktvalue.apply(lambda x: x.sum(), axis=1)
+        df_weight = df_mktvalue.div(total_mktvalue, axis=0)
+        holding_data.add_field(df_weight, "weight")
 
-    def get_returns(self, compound_return=False, consider_commission=True):
+        holding_data._data = holding_data._data.drop(
+            ['AvgPosPrice', 'BuyVolume', 'CumNetTurnOver', 'CumProfit', 'CumProfitComm', 'SellVolume'], axis=1, level=1)
+
+    def _build_portfolio_data(self):
+        assert self.dataview, "Should have dataview"
+        assert self._holding_data != None, "Should build holding data firstly"
+
+        df_weight = self._holding_data.get_ts("weight").shift()
+        df = pd.DataFrame()
+
+        df['holding_return']          = (self._holding_data.get_ts("holding_return")        * df_weight).apply(lambda x: x.sum(), axis=1)
+        df['active_holding_return']   = (self._holding_data.get_ts("active_holding_return") * df_weight).apply(lambda x: x.sum(), axis=1)
+        df['holding_pnl']             = (self._holding_data.get_ts("holding_pnl") ).apply(lambda x: x.sum(), axis=1)
+        df['trading_pnl']             = (self._holding_data.get_ts("trading_pnl") ).apply(lambda x: x.sum(), axis=1)
+
+        self._portfolio_data = df
+
+    def get_returns(self, compound_return=False, consider_commission=True, show_turnover_ratio=False):
         """
         Calculate strategy daily return and various metrics indicating strategy's performance.
         
@@ -535,7 +824,7 @@ class BaseAnalyzer(object):
 
         """
         # only get columns that we need
-        cols = ['trading_pnl', 'holding_pnl', 'total_pnl', 'commission', 'CumProfitComm', 'CumProfit']
+        cols = ['trading_pnl', 'holding_pnl', 'total_pnl', 'commission', 'CumProfitComm', 'CumProfit', 'TurnOver']
         '''
         dic_symbol = {sec: self.inst_map[sec]['multiplier'] * df_daily.loc[:, cols]
                       for sec, df_daily in self.daily.items()}
@@ -567,6 +856,7 @@ class BaseAnalyzer(object):
         df_returns = market_values.pct_change(periods=1).fillna(0.0)
         df_cum_returns = (df_returns.loc[:, ['strat', 'bench']] + 1.0).cumprod()
         df_returns = df_returns.join(df_cum_returns, rsuffix='_cum')
+        df_returns.loc[:,'turnover_ratio'] = df_pnl.loc[:,"TurnOver"] / strategy_value
         
         if compound_return:
             df_returns.loc[:, 'active_cum'] = df_returns['strat_cum'] - df_returns['bench_cum'] + 1
@@ -614,6 +904,7 @@ class BaseAnalyzer(object):
         self.performance_metrics['Daily Win Rate(%)']  = win_rate*100
         self.performance_metrics['Daily Lose Rate(%)'] = lose_rate*100
         self.performance_metrics['Commission']         = df_pnl.loc[:,'commission'].sum()
+        self.performance_metrics['Turnover Ratio']         = df_returns.loc[:,'turnover_ratio'].sum() / years
         
         self.risk_metrics['Beta'] = np.corrcoef(df_returns.loc[:, 'bench'], df_returns.loc[:, 'strat'])[0, 1]
         self.risk_metrics['Maximum Drawdown (%)']   = max_dd * TO_PCT
@@ -624,6 +915,8 @@ class BaseAnalyzer(object):
         self.performance_metrics_report = []
         self.performance_metrics_report.append(('Annual Return (%)',        "{:,.2f}".format( self.performance_metrics['Annual Return (%)']))     )
         self.performance_metrics_report.append(('Annual Volatility (%)',    "{:,.2f}".format( self.performance_metrics['Annual Volatility (%)'])) )
+        if show_turnover_ratio:
+            self.performance_metrics_report.append(('Annual Turnover Ratio',               "{:,.2f}".format( self.performance_metrics['Turnover Ratio']))    )
         self.performance_metrics_report.append(('Sharpe Ratio',             "{:,.2f}".format( self.performance_metrics['Sharpe Ratio']))          )
         self.performance_metrics_report.append(('Total PNL',                "{:,.2f}".format( self.performance_metrics['Total PNL']))             )
         self.performance_metrics_report.append(('Commission',               "{:,.2f}".format( self.performance_metrics['Commission']))            )
@@ -658,12 +951,38 @@ class BaseAnalyzer(object):
         # df_returns = df_returns.join(bt_strat_mv, how='right')
         self.returns = df_returns
     
+    def plot_alpha_decay(self, df, output_folder):
+        fig, ax = plt.subplots(figsize=(16, 8))
+        plt.bar(df.index, df.values)
+        fig.savefig(os.path.join(output_folder, 'alpha_decay.png'), facecolor=fig.get_facecolor(), dpi=fig.get_dpi())
+
+        plt.close(fig)
+
+    def plot_alpha_decay_weight(self, df, output_folder):
+        fig, ax = plt.subplots(figsize=(16, 8))
+        plt.bar(df.index, df.values)
+        fig.savefig(os.path.join(output_folder, 'alpha_decay_weight.png'), facecolor=fig.get_facecolor(), dpi=fig.get_dpi())
+
+        plt.close(fig)
+
+    def plot_cum_alpha_weight(self, df, output_folder):
+        fig, ax = plt.subplots(figsize=(16, 8))
+        ax.plot(range(len(df)), df.mean_weight.cumsum(), lw=1, color='dodgerblue',
+                label='Cumulative weight')
+        ax.plot(range(len(df)), df.alpha_ratio.cumsum(), lw=1, color='darkorchid',
+                label='Cumulative Alpha')
+        ax.legend()
+        ax.grid()
+        fig.savefig(os.path.join(output_folder, 'cum_alpha_weight.png'), facecolor=fig.get_facecolor(), dpi=fig.get_dpi())
+
+        plt.close(fig)
+
     def plot_pnl(self, output_folder):
         """
         Plot 2 graphs:
             1. Percentage return of strategy, benchmark and strategy's excess part.
             2. Daily trading, holding and total PnL.
-        
+
         Parameters
         ----------
         output_folder : str
@@ -672,7 +991,7 @@ class BaseAnalyzer(object):
         """
         old_mpl_rcparams = {k: v for k, v in mpl.rcParams.items()}
         mpl.rcParams.update(MPL_RCPARAMS)
-        
+
         fig1 = plot_portfolio_bench_pnl(self.returns.loc[:, 'strat_cum'],
                                         self.returns.loc[:, 'bench_cum'],
                                         self.returns.loc[:, 'active_cum'],
@@ -680,15 +999,198 @@ class BaseAnalyzer(object):
                                         self.risk_metrics['Maximum Drawdown end'])
         fig1.savefig(os.path.join(output_folder, 'pnl_img.png'), facecolor=fig1.get_facecolor(), dpi=fig1.get_dpi())
         plt.close(fig1)
-        
+
         fig2 = plot_daily_trading_holding_pnl(self.df_pnl['trading_pnl'],
                                               self.df_pnl['holding_pnl'],
                                               self.df_pnl['total_pnl'],
                                               self.df_pnl['total_pnl'].cumsum())
-        fig2.savefig(os.path.join(output_folder, 'pnl_img_trading_holding.png'), facecolor=fig2.get_facecolor(), dpi=fig2.get_dpi())
+        fig2.savefig(os.path.join(output_folder, 'pnl_img_trading_holding.png'), facecolor=fig2.get_facecolor(),
+                     dpi=fig2.get_dpi())
         plt.close(fig2)
-        
+
         mpl.rcParams.update(old_mpl_rcparams)
+
+    def analyze_alpha_decay(self,result_dir):
+
+        # 个股平均持仓
+        df_weight = self.holding_data.get_ts('weight')
+        df_weight = pd.DataFrame(df_weight.mean(axis=0))
+        df_weight.columns = ['mean_weight']
+        df_weight = pd.merge(left=df_weight, right=self.dataview.data_inst[['name']], left_index=True, right_index=True,
+                             how='left')
+        df_weight = df_weight[df_weight['mean_weight'] > 0]
+        #df_weight.sort_values('mean_weight', ascending=False)
+
+        # 个股Alpha合计
+        raw_alpha = self.holding_data.get_ts('active_holding_return')
+        raw_weight = self.holding_data.get_ts('weight')
+
+        df_alpha = raw_alpha.mul(raw_weight)
+        df_alpha = pd.DataFrame(df_alpha.sum(axis=0))
+        df_alpha.columns = ['alpha']
+        df_alpha = pd.merge(left=df_alpha, right=self.dataview.data_inst[['name']], left_index=True, right_index=True, how='left')
+        df_alpha = df_alpha[df_alpha['alpha'] != 0]
+        df_alpha.sort_values('alpha', ascending=False)
+        df_alpha_weight = pd.concat([df_weight, df_alpha], axis=1)
+
+        # Alpha在个股中分布
+        n_group = 5
+        df_alpha_weight = df_alpha_weight.sort_values('mean_weight', ascending=False)
+        df_alpha_weight['rank'] = range(len(df_alpha))
+        df_alpha_weight['group'] = df_alpha_weight['rank'].apply(lambda x: int(x / n_group))
+        df_alpha_weight['alpha_ratio'] = df_alpha_weight['alpha'] / df_alpha_weight['alpha'].sum()
+
+        df_alpha_group = df_alpha_weight.groupby('group')['alpha_ratio'].sum()
+        df_weight_group = df_alpha_weight.groupby('group')['mean_weight'].sum()
+        df_alpha_weight_group = df_alpha_group / df_weight_group
+
+        #df_alpha_weight_group.plot.bar(figsize=(16, 8), grid=True)
+        self.plot_alpha_decay(df_alpha_group,result_dir)
+        self._alpha_decay_image = "alpha_decay.png"
+
+        self.plot_alpha_decay_weight(df_alpha_weight_group,result_dir)
+        self._alpha_decay_weight_image = "alpha_decay_weight.png"
+
+        self.plot_cum_alpha_weight(df_alpha_weight,result_dir)
+        self._cum_alpha_weight_image = "cum_alpha_weight.png"
+
+    def analyze_industry_overweight(self, result_dir):
+        if 'sw1' not in self.dataview.data_d.columns.levels[1]:
+            print("Ignore industry overwight analysis for missing sw1 in dataview")
+            return
+
+        # 个股平均持仓
+        df_weight = self.holding_data.get_ts('weight')
+        df_weight = pd.DataFrame(df_weight.mean(axis=0))
+        df_weight.columns = ['mean_weight']
+        df_weight = pd.merge(left=df_weight, right=self.dataview.data_inst[['name']], left_index=True, right_index=True,
+                             how='left')
+        df_weight = df_weight[df_weight['mean_weight'] > 0]
+
+        raw_weight = self.holding_data.get_ts('weight')[df_weight.index]
+        index = self.dataview.get_ts('sw1')[df_weight.index]
+        index = index.loc[raw_weight.index]
+
+        matching = {
+            '110000': 'NLMY',
+            '210000': 'Digging',
+            '220000': 'Chemistry',
+            '230000': 'Metal',
+            '240000': 'Nonferrous Metal',
+            '270000': 'Electronic',
+            '280000': 'Car',
+            '330000': 'Applicants',
+            '340000': 'Food',
+            '350000': 'Clothing',
+            '360000': 'Light Industrials',
+            '370000': 'Health Care',
+            '410000': 'Utility',
+            '420000': 'Transportation',
+            '430000': 'Housing',
+            '450000': 'Commercial',
+            '460000': 'Service',
+            '480000': 'Bank',
+            '490000': 'Non bank',
+            '510000': 'Others',
+            '610000': 'Construction Material',
+            '620000': 'Construction decoration',
+            '630000': 'Electronic equipment',
+            '640000': 'Mechenical equipment',
+            '650000': 'Army',
+            '710000': 'IT',
+            '720000': 'Media',
+            '730000': 'Telecom',
+            'nan': 'Unclassified'
+        }
+
+        for key, value in matching.items():
+            index = index.replace(key, value)
+
+        def group_sum(df, group_daily):
+            groups = np.unique(group_daily.values.flatten())
+            mask = groups == 'nan'
+            groups = groups[np.logical_not(mask)]
+            res = pd.DataFrame(index=df.index, columns=groups, data=np.nan)
+            for g in groups:
+                mask = group_daily == g
+                tmp = df[mask]
+                res.loc[:, g] = tmp.sum(axis=1)
+            return res
+
+        weight_industry = group_sum(raw_weight, index)
+
+        ## 指数行业分析
+        raw_index_weight = self.dataview.get_ts('index_weight')
+        raw_industry = self.dataview.get_ts('sw1')
+
+
+        for key, value in matching.items():
+            raw_industry = raw_industry.replace(key, value)
+
+
+        weight_index = group_sum(raw_index_weight, raw_industry)
+
+        ## 行业超配分析
+        # weight_industry['Army'] = 0.0
+        # weight_industry['Clothing'] = 0.0
+        # weight_industry['Others'] = 0.0
+
+        weight_dif = weight_industry - weight_index
+        index_weight_industry = pd.DataFrame(weight_index.mean(axis=0).sort_values(ascending=False))
+        index_weight_industry.columns = ['index']
+        #print('相对指数超配')
+        self._industry_overweight_images = []
+        for single_industry in weight_dif.columns:
+            image_name = ('iw_' + single_industry + '.png').replace(' ', '_').lower()
+            self._industry_overweight_images.append(image_name)
+            self.plot_industry_weight(weight_dif, single_industry, image_name, result_dir)
+
+        # 行业平均持仓及相对指数超配
+        portfolio_weight_industry = pd.DataFrame(weight_industry.mean(axis=0).sort_values(ascending=False))
+        portfolio_weight_industry.columns = ['portfolio']
+        weight_industry_compare = pd.concat([portfolio_weight_industry, index_weight_industry], axis=1)
+        weight_industry_compare['overweight'] = weight_industry_compare['portfolio'] - weight_industry_compare['index']
+        self._average_industry_overweight = weight_industry_compare.sort_values('overweight', ascending=False)
+
+    def plot_industry_weight(self, df, industry_name, image_name, output_folder):
+        idx0 = df.index.astype(str)
+        n = len(idx0)
+        idx = np.arange(n)
+        idx2016 = np.where(idx0 == '20160701')
+        fig, ax3 = plt.subplots(figsize=(16, 8))
+        # ax1 = ax0.twinx()
+
+        bar_width = 0.2
+        profit_color, lose_color = '#D63434', '#2DB635'
+        curve_color = '#174F67'
+        y_label = 'Daily Return'
+        color_arr_raw = np.array([profit_color] * n)
+
+        color_arr = color_arr_raw.copy()
+        # color_arr[holding_pnl_tot.PnL < 0] = lose_color
+        # ax3.bar(idx, df_volume_cyb.turnover_300, width = 1, color='green', label = '300', alpha = 0.4)
+        # ax3.bar(idx, df_volume_cyb.turnover_cyb, width = 1, color='yellow', label = 'cyb', alpha = 0.4)
+
+        # ax3.set(title='Cumulative and daily holding PnL', ylabel=y_label)
+        ax3.xaxis.set_major_formatter(MyFormatter(idx0, '%Y%m%d'))
+        ax3.legend()
+        ax3.axhline(0, color='red', lw=1, ls='--')
+        ax3.plot(idx, df[industry_name], color='blue', label='%s' % industry_name, linewidth=1.5, alpha=0.8)
+
+        # ax3.plot(idx, stock_alpha['active_holding_return'].cumsum(), lw=1, color='red', label = 'alpha')
+        # ax6 = ax3.twinx()
+        # ax3.plot(idx, stock_alpha['weight'], lw = 1, color = 'blue', label = 'weight')
+        # ax3.yaxis.label.set_color(curve_color)
+        ax3.grid()
+        plt.tick_params(axis='both', which='major', labelsize=12)
+        plt.legend(fontsize=14)
+        plt.title('%s' % industry_name, fontsize=16)
+        plt.tight_layout()
+
+        fig.savefig(os.path.join(output_folder, image_name),
+                    facecolor=fig.get_facecolor(),
+                    dpi=fig.get_dpi())
+        plt.close(fig)
 
     def gen_report(self, source_dir, template_fn, out_folder='.', selected=None):
         """
@@ -723,7 +1225,11 @@ class BaseAnalyzer(object):
         dic['dailypnl_metrics_report'] = self.dailypnl_metrics_report
         dic['dailypnl_top5_metrics_report'] = self.dailypnl_top5_metrics_report
         dic['dailypnl_tail5_metrics_report'] = self.dailypnl_tail5_metrics_report
-        
+        dic['industry_overweight_images'] = self._industry_overweight_images
+        dic['alpha_decay_image'] = self._alpha_decay_image
+        dic['alpha_decay_weight_image'] = self._alpha_decay_weight_image
+        dic['cum_alpha_weight_image'] = self._cum_alpha_weight_image
+        dic['average_industry_overweight'] = self._average_industry_overweight
         self.report_dic.update(dic)
         
         r = Report(self.report_dic, source_dir=source_dir, template_fn=template_fn, out_folder=out_folder)
@@ -775,6 +1281,7 @@ class BaseAnalyzer(object):
                         out_folder=result_dir,
                         selected=selected_sec)
 
+        return self.performance_metrics_report
 
 class EventAnalyzer(BaseAnalyzer):
     def __init__(self):
@@ -997,7 +1504,7 @@ class AlphaAnalyzer(BaseAnalyzer):
         '''
         print
         
-    def do_analyze(self, result_dir, selected_sec=None, brinson_group=None, compound_rtn = False):
+    def do_analyze(self, result_dir, selected_sec=None, brinson_group=None, compound_rtn = False, show_turnover_ratio = False):
         if selected_sec is None:
             selected_sec = []
     
@@ -1006,7 +1513,7 @@ class AlphaAnalyzer(BaseAnalyzer):
         print("get daily stats...")
         self.get_daily()
         print("calc strategy return...")
-        self.get_returns(compound_return = compound_rtn, consider_commission=True)
+        self.get_returns(compound_return = compound_rtn, consider_commission=True, show_turnover_ratio = show_turnover_ratio)
         print("calc re-balance position")
         self.get_rebalance_position()
         print("Get stats")
@@ -1031,9 +1538,17 @@ class AlphaAnalyzer(BaseAnalyzer):
             if group is None:
                 raise ValueError("group data is None.")
             self.brinson(group, output_folder=result_dir)
-    
-        self.daily_position.to_csv(os.path.join(result_dir, 'daily_position.csv'))
-        self.returns.to_csv(os.path.join(result_dir, 'returns.csv'))
+
+        test_name = self.configs['Name'] if 'Name' in self.configs else "default"
+        self.daily_position.to_csv(os.path.join(result_dir, 'daily_position_%s.csv' % test_name))
+        self.returns.to_csv(os.path.join(result_dir, 'returns_%s.csv' % test_name))
+
+        if self.dataview:
+            print("Analyze alpha data...")
+            self.analyze_alpha_decay(result_dir)
+            self.analyze_industry_overweight(result_dir)
+        else:
+            print("Ignore analyzing alpha data")
 
         print("generate report...")
         self.gen_report(source_dir=STATIC_FOLDER, template_fn='report_template.html',

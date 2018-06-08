@@ -94,8 +94,14 @@ def to_date_int(date):
 
 def to_time_int(time):
     if isinstance(time, basestring):
-        tmp = time.replace(':','')
-        return int(tmp)
+        if ':' in time:
+            tmp = time.replace(':','')
+            return int(tmp)
+        else:
+            t = dt.datetime.strptime(time, "%H:%M:%S")
+            time_int = t.hour * 10000 + t.minute * 100 + t.second
+            return time_int
+
     elif isinstance(time, (int, np.integer)):
         return time
     else:
